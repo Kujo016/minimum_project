@@ -22,7 +22,7 @@ void CompilerTool::CompileSourceFiles_CPP(
     if (!pathToBuilder.empty()) {
         std::string builderFilename = pathToBuilder.stem().string();
         std::filesystem::path builderOBJ =
-            std::filesystem::path(OBJ_DIR) / (builderFilename + OBJ_EXT);
+			std::filesystem::path(OBJ_DIR) / (builderFilename + OBJ_EXT);
 
         if (!std::filesystem::exists(builderOBJ) ||
             std::filesystem::last_write_time(pathToBuilder) >

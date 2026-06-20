@@ -72,6 +72,7 @@ std::string NVCC_LINK_DEBUG =
     DebugBuild ? "-Xlinker \"/DEBUG\"" : "";
 
 
+
 #ifdef _WIN32
 //SET BUILDER PATHS AND NAMES
 //Set Builder_Windows namespace
@@ -84,8 +85,9 @@ const auto projectFolder = std::filesystem::path(PROJ_DIR).filename().string();
 //Get project name in lowercase and set as object name  
 const std::string PROJECT_NAME = ExtractName(projectFolder);
 const std::string OBJ_NAME = ExtractName_to_lower(projectFolder);
-//single source file for WIN
-const auto PATH_TO_BUILDER_CPP = std::filesystem::path(PROJ_DIR) / "builder" / "FileTool_Windows.cpp";
+const auto PATH_TO_BUILDER_CPP =
+    std::filesystem::path(PROJ_DIR) / "builder" / "FileTool_Windows.cpp";
+
 #else
 using namespace Builder_Linux;
 //Get project directory
@@ -97,8 +99,8 @@ auto projectFolder = std::filesystem::path(PROJ_DIR).filename().string();
 const std::string PROJECT_NAME    = ExtractName(projectFolder);
 //Get project name in lowercase and set as object name
 const std::string OBJ_NAME        = ExtractName_to_lower(projectFolder);
-//single source file for LINUX
-const auto PATH_TO_BUILDER_CPP = std::filesystem::path(PROJ_DIR) / "builder" / "FileTool_Linux.cpp";
+const auto PATH_TO_BUILDER_CPP =
+    std::filesystem::path(PROJ_DIR) / "builder" / "FileTool_Linux.cpp";
 #endif
 
 //SET INCLUDES AND EXTENSIONS BASED ON OS
@@ -146,6 +148,8 @@ static std::string GetCudaToolkitLibDir() {
 //Set object extension
 const std::string OBJ_EXT = ".obj";
 const std::string EXE_EXT = ".exe";
+const std::string DLL_EXT = ".dll";
+
 //HELPER FUNCTIONS
 //Quote function for returning slash escaped strings
 static std::string Quote(const std::string& value) {
@@ -272,13 +276,29 @@ static bool IsBuildableTarget(const std::filesystem::path& targetDir) {
            std::filesystem::exists(targetDir / "include");
 }
 
-static std::filesystem::path ResolveLibDir(const std::filesystem::path& targetDir) {
+static std::filesystem::path ResolveSdlImportLibDir(const std::filesystem::path& targetDir) {
     const auto targetLib = targetDir / "lib";
     if (std::filesystem::exists(targetLib / "SDL3.lib")) {
         return targetLib;
     }
 
-    return std::filesystem::path(PROJ_DIR) / "lib";
+    return std::filesystem::path(PROJ_DIR) / "system" / "lib";
+}
+
+static std::filesystem::path ResolveRuntimeDllDir(const std::filesystem::path& targetDir) {
+#ifdef _WIN32
+    const char* configuredDir = std::getenv("VECTORISO_RUNTIME_DLL_DIR");
+    if (configuredDir && *configuredDir) {
+        return std::filesystem::path(configuredDir).lexically_normal();
+    }
+#endif
+
+    const auto targetDllDir = targetDir / "dll";
+    if (std::filesystem::exists(targetDllDir)) {
+        return targetDllDir;
+    }
+
+    return std::filesystem::path(PROJ_DIR) / "system" / "dll";
 }
 
 static std::string ToLower(std::string value) {
@@ -296,6 +316,47 @@ static bool UsesSdl(const std::filesystem::path& targetDir) {
     return ToLower(targetDir.filename().string()) ==  "system" && std::filesystem::exists(std::filesystem::path(PROJ_DIR) / "lib" / "SDL3.lib");
 }
 
+static bool HasPyQtDllEntry(const std::filesystem::path& targetDir) {
+#ifdef _WIN32
+    return std::filesystem::exists(targetDir / "src" / "mainPyQt6.cpp");
+#else
+    return false;
+#endif
+}
+
+#ifdef _WIN32
+static bool StageRuntimeDll(
+    const std::filesystem::path& runtimeDllDir,
+    const std::filesystem::path& binDir,
+    const std::string& dllName
+) {
+    const auto source = runtimeDllDir / dllName;
+    const auto destination = binDir / dllName;
+
+    if (!std::filesystem::exists(source)) {
+        std::cerr << "[ERROR] Missing local runtime DLL: " << source << "\n";
+        return false;
+    }
+
+    std::error_code copyError;
+    std::filesystem::copy_file(
+        source,
+        destination,
+        std::filesystem::copy_options::overwrite_existing,
+        copyError
+    );
+
+    if (copyError) {
+        std::cerr << "[ERROR] Failed to stage " << source << " to "
+                  << destination << ": " << copyError.message() << "\n";
+        return false;
+    }
+
+    std::cout << "Staged runtime DLL: " << destination << "\n";
+    return true;
+}
+#endif
+
 static int BuildTarget(const std::filesystem::path& targetDir, const std::vector<std::filesystem::path>& includeDirs) {
     if (!IsBuildableTarget(targetDir)) {
         std::cerr << "[ERROR] Build target must contain src and include folders: " << targetDir << "\n";
@@ -307,21 +368,36 @@ static int BuildTarget(const std::filesystem::path& targetDir, const std::vector
     const std::string includeDir = (targetDir / "include").string();
     const std::string objDir = (targetDir / "obj").string();
     const bool usesSdl = UsesSdl(targetDir);
-    const std::string libDir = usesSdl ? ResolveLibDir(targetDir).string() : "";
-    const std::string binDir = (targetDir / "bin").string();
-    #ifdef __CUDACC__
-    const auto exe =
-        std::filesystem::path(binDir) /
-        (std::string("CUDA_") + exeName + EXE_EXT);
-    #else
+    const std::string libDir = usesSdl ? ResolveSdlImportLibDir(targetDir).string() : "";
+    const auto runtimeDllDir = ResolveRuntimeDllDir(targetDir);
+    const auto binPath = targetDir / "bin";
+    const std::string binDir = binPath.string();
+	
+	
     const auto exe = std::filesystem::path(binDir) / (exeName + EXE_EXT);
-    #endif
     const std::string projectIncludes = BuildIncludeFlags(targetDir, includeDirs);
 
     std::cout << "Building target: " << targetDir << "\n";
     std::cout << "BIN_DIR: " << binDir << "\n";
     std::cout << "OBJ_DIR: " << objDir << "\n";
-    fileTool.CreateDirectory({objDir, binDir});
+    std::cout << "RUNTIME_DLL_DIR: " << runtimeDllDir << "\n";
+    fileTool.CreateDirectory({objDir, binDir});	
+
+#ifdef _WIN32
+    if (usesSdl && !std::filesystem::exists(runtimeDllDir / "SDL3.dll")) {
+        std::cerr << "[ERROR] SDL3.dll must exist in the local runtime directory: "
+                  << runtimeDllDir << "\n";
+        return 1;
+    }
+
+    #ifdef __CUDACC__
+    if (!std::filesystem::exists(runtimeDllDir / "cudart64_12.dll")) {
+        std::cerr << "[ERROR] cudart64_12.dll must exist in the local runtime directory: "
+                  << runtimeDllDir << "\n";
+        return 1;
+    }
+    #endif
+#endif
 
     std::cout << "Begin compiling..." << exeName << "\n";
     #ifndef _WIN32
@@ -330,7 +406,7 @@ static int BuildTarget(const std::filesystem::path& targetDir, const std::vector
                 std::cout << " Compiling " << entry.path() << "\n";
                 compilerTool.CompileSourceFiles_CPP(
                     entry.path(),
-                    PATH_TO_BUILDER_CPP,
+					PATH_TO_BUILDER_CPP,
                     projectIncludes,
                     objDir,
                     OBJ_EXT,
@@ -350,7 +426,7 @@ static int BuildTarget(const std::filesystem::path& targetDir, const std::vector
                 std::cout << " Compiling " << entry.path() << "\n";
                 compilerTool.CompileSourceFiles_CPP(
                     entry.path(),
-                    PATH_TO_BUILDER_CPP,
+					PATH_TO_BUILDER_CPP,
                     cppIncludes,
                     objDir,
                     OBJ_EXT,
@@ -379,7 +455,7 @@ static int BuildTarget(const std::filesystem::path& targetDir, const std::vector
             std::cout << " Compiling " << entry.path() << "\n";
             compilerTool.CompileSourceFiles_CUDA(
                 entry.path(),
-                PATH_TO_BUILDER_CPP,
+				PATH_TO_BUILDER_CPP,
                 cudaCompileFlags,
                 objDir,
                 OBJ_EXT,
@@ -411,24 +487,32 @@ static int BuildTarget(const std::filesystem::path& targetDir, const std::vector
             );
         #endif
     #else
+		std::string objs = GatherObjs(objDir);
         #ifdef __CUDACC__
-            std::string objs = GatherObjs(objDir);
-            const std::string cudaLibDir = GetCudaToolkitLibDir();
-            if (cudaLibDir.empty()) {
-                std::cerr << "[ERROR] CUDA_PATH must point to a CUDA toolkit with lib\\x64 when CUDA is enabled.\n";
-                return 1;
-            }
-            compilerTool.RunCommand(
-                "nvcc " + objs +
-                "-o " + Quote(exe) + " "
-                + std::string(usesSdl ? "-L" + Quote(libDir) + " " : "") +
-                "-L" + Quote(cudaLibDir) + " "
-                "-lcudart user32.lib gdi32.lib opengl32.lib " +
-                std::string(usesSdl ? "SDL3.lib " : "") +
-                "-Xcompiler \"" + std::string(DebugBuild ? MSVC_DEBUG_FLAGS : MSVC_RELEASE_FLAGS) + "\" " + NVCC_LINK_DEBUG
-            );
-        #else
-            std::string objs = GatherObjs(objDir);
+			const std::string cudaLibDir = GetCudaToolkitLibDir();
+
+			if (cudaLibDir.empty()) {
+				std::cerr << "[ERROR] CUDA_PATH must point to a CUDA toolkit with lib\\x64 when CUDA is enabled.\n";
+				return 1;
+			}
+
+			const auto pdb =
+				std::filesystem::path(binDir) /
+				(exeName + ".pdb");
+
+			compilerTool.RunCommand(
+				"nvcc " + objs +
+				"-o " + Quote(exe) + " "
+				+ std::string(usesSdl ? "-L" + Quote(libDir) + " " : "") +
+				"-L" + Quote(cudaLibDir) + " "
+				"-lcudart user32.lib gdi32.lib opengl32.lib " +
+				std::string(usesSdl ? "SDL3.lib " : "") +
+				"-Xcompiler \"" + std::string(DebugBuild ? MSVC_DEBUG_FLAGS : MSVC_RELEASE_FLAGS) + "\" " +
+				(DebugBuild
+					? "-Xlinker \"/DEBUG\" -Xlinker \"/PDB:\\\"" + pdb.string() + "\\\"\" "
+					: "")
+			);
+		#else				
             compilerTool.RunCommand(
                 "cl " + objs +
                 " /Fe:" + Quote(exe) + " " +
@@ -437,6 +521,60 @@ static int BuildTarget(const std::filesystem::path& targetDir, const std::vector
                 std::string(usesSdl ? " /LIBPATH:" + Quote(libDir) + " SDL3.lib" : "") +
                 " user32.lib"
             );
+        #endif
+
+        if (HasPyQtDllEntry(targetDir)) {
+            const auto dll =
+                std::filesystem::path(binDir) /
+                (exeName + "PyQt6" + DLL_EXT);
+            const auto dllPdb =
+                std::filesystem::path(binDir) /
+                (exeName + "PyQt6.pdb");
+            const auto importLib =
+                std::filesystem::path(binDir) /
+                (exeName + "PyQt6.lib");
+            std::error_code removeError;
+            std::filesystem::remove(dll, removeError);
+
+            std::cout << "Linking PyQt6 DLL: " << dll << "\n";
+
+            #ifdef __CUDACC__
+                compilerTool.RunCommand(
+                    "nvcc -shared " + objs +
+                    "-o " + Quote(dll) + " "
+                    + std::string(usesSdl ? "-L" + Quote(libDir) + " " : "") +
+                    "-L" + Quote(cudaLibDir) + " "
+                    "-lcudart user32.lib gdi32.lib opengl32.lib " +
+                    std::string(usesSdl ? "SDL3.lib " : "") +
+                    "-Xcompiler \"" + std::string(DebugBuild ? MSVC_DEBUG_FLAGS : MSVC_RELEASE_FLAGS) + "\""
+                );
+            #else
+                compilerTool.RunCommand(
+                    "cl " + objs +
+                    " /LD /Fe:" + Quote(dll) + " " +
+                    (DebugBuild ? MSVC_DEBUG_FLAGS : MSVC_RELEASE_FLAGS) +
+                    " /link " + LINK_DEBUG +
+                    " /PDB:" + Quote(dllPdb) +
+                    " /IMPLIB:" + Quote(importLib) +
+                    std::string(usesSdl ? " /LIBPATH:" + Quote(libDir) + " SDL3.lib" : "") +
+                    " user32.lib gdi32.lib opengl32.lib"
+                );
+            #endif
+
+            if (!std::filesystem::exists(dll)) {
+                std::cerr << "[ERROR] PyQt6 DLL was not created: " << dll << "\n";
+                return 1;
+            }
+        }
+
+        if (usesSdl && !StageRuntimeDll(runtimeDllDir, binPath, "SDL3.dll")) {
+            return 1;
+        }
+
+        #ifdef __CUDACC__
+        if (!StageRuntimeDll(runtimeDllDir, binPath, "cudart64_12.dll")) {
+            return 1;
+        }
         #endif
     #endif
 
